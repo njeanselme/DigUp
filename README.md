@@ -7,9 +7,13 @@ Search the files on your computer by what's in them, with Google DeepMind's
 <a href="https://huggingface.co/google/embeddinggemma-2">EmbeddingGemma 2</a>.</p>
 
 <p align="center"><a href="https://github.com/ARahim3/DigUp/releases/latest"><b>Download for Mac</b></a> ·
-<a href="https://github.com/ARahim3/DigUp/releases/tag/v0.7.0-beta.3"><b>Windows (beta)</b></a> ·
+<a href="https://github.com/njeanselme/DigUp/releases/latest"><b>Windows (beta, with Outlook mail)</b></a> ·
 <a href="https://github.com/ARahim3/DigUp/releases/tag/v0.7.0-beta.3"><b>Linux (beta)</b></a><br>
 <sub>Free and open source. Everything runs on your computer.</sub></p>
+
+<p align="center"><sub>This is the <code>pst</code> branch of a fork: DigUp as released, plus search in Outlook mail kept in
+.pst files on Windows (<a href="https://github.com/ARahim3/DigUp/issues/69">ARahim3/DigUp#69</a>). Its Windows build doesn't
+take DigUp's updates, which would remove the mail: new versions come here.</sub></p>
 
 <p align="center">
 <a href="https://github.com/ARahim3/DigUp/stargazers"><img src="https://img.shields.io/github/stars/ARahim3/DigUp?style=flat-square" alt="GitHub stars"></a>

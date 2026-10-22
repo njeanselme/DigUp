@@ -88,6 +88,29 @@ fn read_gives_plain_text_bodies_and_attachments() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Reading never writes: a PST the user can't write to is read all the same, and comes out byte for byte the same.
+#[cfg(unix)]
+#[test]
+fn reads_without_writing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("digup-pst-readonly-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("readonly.pst");
+    std::fs::copy(data("outlook_made.pst"), &copy).unwrap();
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let before = std::fs::read(&copy).unwrap();
+    let path = copy.to_string_lossy().to_string();
+    let (code, listed) = run(&["list", &path]);
+    assert_eq!(code, Some(0));
+    let node = listed.iter().find(|l| l["type"] == "mail").unwrap()["node"].to_string();
+    let (code, read) = run(&["read", &path, &node]);
+    assert_eq!(code, Some(0));
+    assert_eq!(read.iter().filter(|l| l["type"] == "mail").count(), 1);
+    assert_eq!(std::fs::read(&copy).unwrap(), before);
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn read_reports_nodes_that_are_not_mails() {
     let (code, lines) = run(&["read", &pst(), "99"]);

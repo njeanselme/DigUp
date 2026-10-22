@@ -72,9 +72,14 @@ public enum Mail {
         let attachments: [(name: String, path: String?, embedded: String?)]
     }
 
+    /// How long the tool may take: listing a big PST is seconds to a minute, reading a batch of mails less. Past it, the
+    /// tool is stopped: a PST it can't get through (damaged, or made to loop) fails instead of holding indexing.
+    static let listTimeout: TimeInterval = 10 * 60
+    static let readTimeout: TimeInterval = 2 * 60
+
     /// The PST's mails, without their bodies. Seconds for a big PST.
     static func list(_ mailbox: String) throws -> [Listed] {
-        try lines(["list", mailbox]).compactMap { line in
+        try lines(["list", mailbox], timeout: listTimeout).compactMap { line in
             guard line["type"] as? String == "mail", let node = (line["node"] as? NSNumber)?.uint32Value else { return nil }
             let date = line["received"] as? String ?? line["sent"] as? String
             return Listed(node: node, folder: line["folder"] as? String ?? "", subject: line["subject"] as? String ?? "",
@@ -87,7 +92,8 @@ public enum Mail {
     /// PST isn't in the result.
     static func read(_ mailbox: String, nodes: [UInt32], attachmentsTo folder: URL) throws -> [UInt32: Content] {
         var out: [UInt32: Content] = [:]
-        for line in try lines(["read", mailbox] + nodes.map(String.init) + ["--attachments", folder.path]) {
+        for line in try lines(["read", mailbox] + nodes.map(String.init) + ["--attachments", folder.path],
+                              timeout: readTimeout) {
             guard line["type"] as? String == "mail", let node = (line["node"] as? NSNumber)?.uint32Value else { continue }
             let recipients = (line["recipients"] as? [[String: Any]] ?? []).map { recipient in
                 (kind: recipient["kind"] as? String ?? "to", name: person(recipient["name"], recipient["email"]))
@@ -151,8 +157,13 @@ public enum Mail {
     }
 
     /// Runs the tool and parses its JSON lines. Exit 3: the PST is locked.
-    private static func lines(_ arguments: [String]) throws -> [[String: Any]] {
+    private static func lines(_ arguments: [String], timeout: TimeInterval) throws -> [[String: Any]] {
         guard let tool else { throw ExtractError.unreadable("digup-pst isn't installed (Outlook mail needs it)") }
+        return try run(tool, arguments, timeout: timeout)
+    }
+
+    /// Runs `tool`, stopping it past `timeout`, and parses its JSON lines.
+    static func run(_ tool: String, _ arguments: [String], timeout: TimeInterval) throws -> [[String: Any]] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: tool)
         process.arguments = arguments
@@ -161,8 +172,19 @@ public enum Mail {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
         try process.run()
+        let timedOut = Flag()
+        let deadline = DispatchWorkItem {
+            guard process.isRunning else { return }
+            timedOut.set()
+            process.terminate()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        deadline.cancel()
+        if timedOut.isSet {
+            throw ExtractError.unreadable("digup-pst took more than \(Int(timeout)) seconds")
+        }
         if process.terminationStatus == 3 { throw Failure.locked }
         guard process.terminationStatus == 0 else {
             throw ExtractError.unreadable("digup-pst failed (\(process.terminationStatus))")
@@ -170,5 +192,13 @@ public enum Mail {
         return data.split(separator: UInt8(ascii: "\n")).compactMap {
             try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
         }
+    }
+
+    /// Set once, from another thread.
+    private final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.withLock { value = true } }
+        var isSet: Bool { lock.withLock { value } }
     }
 }

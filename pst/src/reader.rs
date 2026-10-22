@@ -3,7 +3,13 @@
 //! The crate reads attachments only from concrete store and message types (Unicode or ANSI PST),
 //! so the walk is generic over a small `Backend` trait implemented for both.
 
-use std::{collections::BTreeMap, io, path::Path, rc::Rc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs::File,
+    io,
+    path::Path,
+    rc::Rc,
+};
 
 use outlook_pst::{
     ltp::{prop_context::PropertyValue, table_context::TableContext},
@@ -14,7 +20,7 @@ use outlook_pst::{
         store::{AnsiStore, EntryId, Store, UnicodeStore},
     },
     ndb::node_id::NodeId,
-    AnsiPstFile, UnicodePstFile,
+    AnsiPstFile, PstReader, UnicodePstFile,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +58,23 @@ const PR_SENT_REPRESENTING_SMTP_ADDRESS: u16 = 0x5D02;
 const PR_ATTACHMENT_HIDDEN: u16 = 0x7FFE;
 
 const ATTACH_BY_VALUE: i32 = 1;
+
+/// Past these, a PST's content is cut short rather than read whole: an HTML body is converted from its first
+/// `MAX_HTML_BYTES`, a body keeps its first `MAX_BODY_CHARS` (DigUp indexes ~64,000 characters of a mail), an attachment
+/// over `MAX_ATTACHMENT_BYTES` isn't written out (DigUp reads no bigger zip entry either), and folders nest at most
+/// `MAX_FOLDER_DEPTH` deep. A damaged or crafted PST then costs a bounded amount of time and memory.
+pub const MAX_HTML_BYTES: usize = 8 << 20;
+pub const MAX_BODY_CHARS: usize = 1_000_000;
+pub const MAX_ATTACHMENT_BYTES: usize = 64 << 20;
+pub const MAX_FOLDER_DEPTH: usize = 64;
+
+/// The first `max` characters of `text`.
+fn capped(mut text: String, max: usize) -> String {
+    if let Some((end, _)) = text.char_indices().nth(max) {
+        text.truncate(end);
+    }
+    text
+}
 
 /// Options of a run.
 pub struct Options<'a> {
@@ -120,10 +143,12 @@ pub enum Opened {
 }
 
 pub fn open(path: &Path) -> io::Result<Opened> {
-    match UnicodePstFile::open(path) {
-        Ok(file) => Ok(Opened::Unicode(UnicodeBackend(UnicodeStore::read(Rc::new(file))?))),
+    // Read only: the crate's own `open` also takes a handle for writing, which nothing here needs.
+    let file = || File::open(path).map(|f| Box::new(f) as Box<dyn PstReader>);
+    match file().and_then(UnicodePstFile::read_from) {
+        Ok(pst) => Ok(Opened::Unicode(UnicodeBackend(UnicodeStore::read(Rc::new(pst))?))),
         Err(err) if is_locked(&err) => Err(err),
-        Err(_) => Ok(Opened::Ansi(AnsiBackend(AnsiStore::read(Rc::new(AnsiPstFile::open(path)?))?))),
+        Err(_) => Ok(Opened::Ansi(AnsiBackend(AnsiStore::read(Rc::new(AnsiPstFile::read_from(file()?)?))?))),
     }
 }
 
@@ -241,13 +266,23 @@ fn code_page_of(get: &Props) -> Option<u32> {
 
 /// Body text and where it came from: plain text, else HTML, else RTF.
 fn body(get: &Props) -> (&'static str, String) {
+    let (kind, text) = whole_body(get);
+    (kind, capped(text, MAX_BODY_CHARS))
+}
+
+fn whole_body(get: &Props) -> (&'static str, String) {
     let cp = code_page_of(get);
     if let Some(text) = string(get(PR_BODY), cp).filter(|t| !t.trim().is_empty()) {
         return ("text", collapse_blank_lines(&text));
     }
     let html = match get(PR_HTML) {
-        Some(PropertyValue::Binary(v)) => Some(decode_8bit(v.buffer(), cp.or(Some(65001)))),
-        other => string(other, cp),
+        Some(PropertyValue::Binary(v)) => {
+            Some(decode_8bit(&v.buffer()[..v.buffer().len().min(MAX_HTML_BYTES)], cp.or(Some(65001))))
+        }
+        other => string(other, cp).map(|h| {
+            let end = (0..=h.len().min(MAX_HTML_BYTES)).rev().find(|&i| h.is_char_boundary(i)).unwrap_or(0);
+            h[..end].to_string()
+        }),
     };
     if let Some(html) = html.filter(|h| !h.trim().is_empty()) {
         return ("html", html_to_text(&html));
@@ -398,6 +433,13 @@ impl<'a, B: Backend> Walker<'a, B> {
     }
 
     fn folder(&mut self, folder: Rc<dyn Folder>, path: &str, emit: &mut dyn FnMut(Value)) {
+        self.folder_at(folder, path, 0, &mut HashSet::new(), emit);
+    }
+
+    /// A folder, then its subfolders: each once (`seen`: a damaged PST can list a folder inside itself), and no deeper
+    /// than `MAX_FOLDER_DEPTH`.
+    fn folder_at(&mut self, folder: Rc<dyn Folder>, path: &str, depth: usize, seen: &mut HashSet<u32>,
+                 emit: &mut dyn FnMut(Value)) {
         self.stats.folders += 1;
         let store = self.backend.store();
         if let Some(contents) = folder.contents_table() {
@@ -417,11 +459,19 @@ impl<'a, B: Backend> Walker<'a, B> {
         if let Some(hierarchy) = folder.hierarchy_table() {
             let nodes: Vec<u32> = hierarchy.rows_matrix().map(|row| u32::from(row.id())).collect();
             for node in nodes {
+                if !seen.insert(node) {
+                    self.error(path, Some(node), &"folder listed twice", emit);
+                    continue;
+                }
+                if depth >= MAX_FOLDER_DEPTH {
+                    self.error(path, Some(node), &"folders nested too deep", emit);
+                    continue;
+                }
                 let sub = store.properties().make_entry_id(NodeId::from(node)).and_then(|id| store.open_folder(&id));
                 match sub {
                     Ok(sub) => {
                         let name = sub.properties().display_name().unwrap_or_default();
-                        self.folder(sub, &format!("{path}/{name}"), emit);
+                        self.folder_at(sub, &format!("{path}/{name}"), depth + 1, seen, emit);
                     }
                     Err(err) => self.error(path, Some(node), &err, emit),
                 }
@@ -508,7 +558,9 @@ impl<'a, B: Backend> Walker<'a, B> {
             match attachment.data() {
                 Some(AttachmentData::Binary(data)) if method == ATTACH_BY_VALUE => {
                     item["bytes"] = json!(data.buffer().len());
-                    if let Some(dir) = self.options.attachments_dir {
+                    if data.buffer().len() > MAX_ATTACHMENT_BYTES {
+                        item["skipped"] = json!("too big");
+                    } else if let Some(dir) = self.options.attachments_dir {
                         let path = dir.join(format!("{entry_id}_{n}{}", safe_name(&name)));
                         match std::fs::write(&path, data.buffer()) {
                             Ok(()) => item["path"] = json!(path.to_string_lossy()),
@@ -559,6 +611,13 @@ mod tests {
         assert!(is_address("jean@x.fr"));
         assert!(!is_address("Michelle Cash"));
         assert!(!is_address("/O=ENRON/OU=NA/CN=RECIPIENTS/CN=MCASH"));
+    }
+
+    #[test]
+    fn capped_keeps_whole_characters() {
+        assert_eq!(capped("éàü".to_string(), 2), "éà");
+        assert_eq!(capped("abc".to_string(), 3), "abc");
+        assert_eq!(capped(String::new(), 0), "");
     }
 
     #[test]

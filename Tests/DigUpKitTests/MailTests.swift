@@ -123,6 +123,27 @@ import Testing
         #expect(try indexer.run()["done"] == 3)
     }
 
+    /// A PST digup-pst can't get through (damaged, or made to loop) fails instead of holding indexing.
+    @Test func aToolThatRunsTooLongIsStopped() {
+        let started = Date()
+        #expect(throws: ExtractError.self) { try Mail.run("/bin/sleep", ["30"], timeout: 0.5) }
+        #expect(Date().timeIntervalSince(started) < 10)
+    }
+
+    /// When the watchdog stops a batch of mails, it names the batch's first mail: that mail fails, the others are read
+    /// by the next batch (naming the PST would leave them all to read again, and again).
+    @Test func aStoppedMailFailsAloneAndTheRestIsRead() throws {
+        try copyPST(to: pst)
+        let store = try store()
+        let indexer = try indexer(store)
+        _ = try indexer.sync([files])
+        let first = try #require(try store.mails(in: pst.path).first)
+        #expect(try store.markStopped(first.path, why: "took more than 15 minutes to read"))
+        #expect(try indexer.run()["done"] == 29)
+        let states = try store.mails(in: pst.path).map { ($0.path, $0.state) }
+        #expect(states.filter { $0.1 == "failed" }.map(\.0) == [first.path])
+    }
+
     @Test func aMailsPreviewIsItsBeginning() throws {
         try copyPST(to: pst)
         let store = try store()

@@ -33,7 +33,7 @@ mod windows_outlook {
                 CLSIDFromProgID, CoCreateInstance, CoInitializeEx, IDispatch, CLSCTX_LOCAL_SERVER,
                 COINIT_APARTMENTTHREADED, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, EXCEPINFO,
             },
-            UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY},
+            UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId},
         },
     };
 
@@ -181,11 +181,18 @@ mod windows_outlook {
             .and_then(Object::object)
             .map_err(|_| fail(6, "Outlook can't find this mail in the PST"))?;
 
-        // The shell started this program from the foreground: let Outlook come in front of it.
-        unsafe {
-            let _ = AllowSetForegroundWindow(ASFW_ANY);
-        }
         mail.method("Display", &[VARIANT::from(false)]).map_err(com)?;
+        // The shell started this program from the foreground: let Outlook, and only Outlook, come in front of it. Its
+        // windows (the mail's included) are of the class "rctrl_renwnd32".
+        unsafe {
+            if let Ok(window) = FindWindowW(windows::core::w!("rctrl_renwnd32"), PCWSTR::null()) {
+                let mut process = 0u32;
+                GetWindowThreadProcessId(window, Some(&mut process));
+                if process != 0 {
+                    let _ = AllowSetForegroundWindow(process);
+                }
+            }
+        }
         if let Ok(window) = mail.get("GetInspector").and_then(Object::object) {
             let _ = window.method("Activate", &[]);
         }

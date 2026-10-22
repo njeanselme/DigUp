@@ -590,8 +590,9 @@ public final class Indexer {
     /// Mails of one PST, read in one go. Those the PST no longer has fail; all of them wait while Outlook has it open.
     private static func readMails(_ batch: [FileRecord], options: IndexOptions, into folder: URL,
                                   outcomes: inout [Int: Outcome]) throws -> [ReadyMail] {
+        // The watchdog knows the batch by its first mail (`prepare`), not by the PST: if it has to stop this batch, that
+        // mail fails and the next batch starts after it, where stopping the PST would leave its mails to read again.
         guard let mailbox = Mail.split(batch[0].path)?.mailbox else { throw ExtractError.unreadable("not a mail") }
-        startReading(mailbox)
         let nodes = batch.map { Mail.split($0.path)?.node ?? 0 }
         let read: [UInt32: Mail.Content]
         do {
